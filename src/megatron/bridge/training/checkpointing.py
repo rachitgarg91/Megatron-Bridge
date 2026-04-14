@@ -1782,12 +1782,19 @@ def _interleave_glu_bias(bias: torch.Tensor, interleave_size: int) -> torch.Tens
 
 
 def _is_swiglu_fc1_checkpoint_key(key: str) -> bool:
-    """True for MoE local-expert SwiGLU linear_fc1 weights/biases (not shared_experts)."""
-    return (
+    """True for MoE local-expert SwiGLU linear_fc1 weights/biases (not shared_experts)
+    and dense SwiGLU linear_fc1 weights/biases."""
+    is_swiglu_fc1_dense = (
+        "experts" not in key
+        and "mlp" in key
+        and ("linear_fc1.weight" in key or "linear_fc1.bias" in key)
+    )
+    is_swiglu_fc1_moe = (
         "shared_experts" not in key
         and "experts" in key
         and ("linear_fc1.weight" in key or "linear_fc1.bias" in key)
     )
+    return is_swiglu_fc1_dense or is_swiglu_fc1_moe
 
 
 def _apply_glu_interleave_to_tensor_data(
