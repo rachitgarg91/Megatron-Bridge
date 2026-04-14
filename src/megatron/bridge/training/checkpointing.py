@@ -1703,82 +1703,34 @@ def load_checkpoint(
     )
 
 
-def _deinterleave_glu_weight(weight: torch.Tensor, interleave_size: int) -> torch.Tensor:
-    """
-    De-interleave GLU weight from block-interleaved format to contiguous format.
-    
-    Interleaved format (dim=0): [W0:31, V0:31, W32:63, V32:63, ...]
-    Output format: [W_all, V_all]
-    """
-    shape = weight.shape
-    weight = weight.reshape(
-        shape[0] // (2 * interleave_size),  # num_blocks
-        2,                                   # W and V interleaved
-        interleave_size,                     # block size
-        *shape[1:]                           # remaining dimensions
-    )
-    weight = weight.transpose(0, 1).contiguous()
-    weight = weight.reshape(shape)
-    return weight
+def _deinterleave_glu_tensor(tensor: torch.Tensor, interleave_size: int) -> torch.Tensor:
+    """De-interleave SwiGLU fc1 tensor along dim 0: block-interleaved -> contiguous [W_all, V_all].
 
-
-def _deinterleave_glu_bias(bias: torch.Tensor, interleave_size: int) -> torch.Tensor:
+    Same layout for ``linear_fc1.weight`` (dim 0 + remaining dims) and ``linear_fc1.bias`` (dim 0 only).
+    Interleaved format (dim 0): [W0:k, V0:k, Wk:2k, Vk:2k, ...] with ``k = interleave_size``.
     """
-    De-interleave GLU bias from block-interleaved format to contiguous format.
-    
-    Interleaved format: [W0:31, V0:31, W32:63, V32:63, ...]
-    Output format: [W_all, V_all]
-    """
-    shape = bias.shape
-    bias = bias.reshape(
-        shape[0] // (2 * interleave_size),  # num_blocks
-        2,  # W and V interleaved
-        interleave_size,  # block size
+    shape = tensor.shape
+    x = tensor.reshape(
+        shape[0] // (2 * interleave_size),
+        2,
+        interleave_size,
         *shape[1:],
     )
-    bias = bias.transpose(0, 1).contiguous()
-    bias = bias.reshape(shape)
-    return bias
+    x = x.transpose(0, 1).contiguous()
+    return x.reshape(shape)
 
 
-def _interleave_glu_weight(weight: torch.Tensor, interleave_size: int) -> torch.Tensor:
-    """
-    Interleave GLU weight from concatenated format to block-interleaved format.
-    
-    Input format: [W_all, V_all] (concatenated along dim -2 or dim 0)
-    Output format (dim 0): [W0:31, V0:31, W32:63, V32:63, ...]
-    """
-    shape = weight.shape
-    
-    weight = weight.reshape(
-        2,                                        # W and V
-        shape[0] // (2 * interleave_size),  # num_blocks
-        interleave_size,                          # block size
-        *shape[1:]                                # remaining dimensions
-    )
-    weight = weight.transpose(0, 1).contiguous()
-    weight = weight.reshape(shape)
-    return weight
-
-
-def _interleave_glu_bias(bias: torch.Tensor, interleave_size: int) -> torch.Tensor:
-    """
-    Interleave GLU bias from concatenated format to block-interleaved format.
-    
-    Input format: [W_all, V_all] (concatenated)
-    Output format: [W0:31, V0:31, W32:63, V32:63, ...]
-    """
-    shape = bias.shape
-
-    bias = bias.reshape(
+def _interleave_glu_tensor(tensor: torch.Tensor, interleave_size: int) -> torch.Tensor:
+    """Interleave SwiGLU fc1 tensor along dim 0: contiguous [W_all, V_all] -> block-interleaved."""
+    shape = tensor.shape
+    x = tensor.reshape(
         2,
         shape[0] // (2 * interleave_size),
         interleave_size,
         *shape[1:],
     )
-    bias = bias.transpose(0, 1).contiguous()
-    bias = bias.reshape(shape)
-    return bias
+    x = x.transpose(0, 1).contiguous()
+    return x.reshape(shape)
 
 
 def _is_swiglu_fc1_checkpoint_key(key: str) -> bool:
@@ -1798,19 +1750,13 @@ def _is_swiglu_fc1_checkpoint_key(key: str) -> bool:
 
 
 def _apply_glu_interleave_to_tensor_data(
-    key: str, tensor: torch.Tensor, interleave_size: int, interleave: bool
+    tensor: torch.Tensor, interleave_size: int, interleave: bool
 ) -> torch.Tensor:
-    """Run interleave or de-interleave on a plain tensor (fc1 weight or bias)."""
-    if "linear_fc1.weight" in key:
-        return (
-            _interleave_glu_weight(tensor, interleave_size)
-            if interleave
-            else _deinterleave_glu_weight(tensor, interleave_size)
-        )
+    """Run interleave or de-interleave on fc1 weight or bias (identical dim-0 layout)."""
     return (
-        _interleave_glu_bias(tensor, interleave_size)
+        _interleave_glu_tensor(tensor, interleave_size)
         if interleave
-        else _deinterleave_glu_bias(tensor, interleave_size)
+        else _deinterleave_glu_tensor(tensor, interleave_size)
     )
 
 
@@ -1844,7 +1790,7 @@ def _process_state_dict_for_glu_interleaving(
                 processed_state_dict[key] = value
                 continue
             new_data = _apply_glu_interleave_to_tensor_data(
-                key, value.data, interleave_size, interleave
+                value.data, interleave_size, interleave
             )
             # Interleaving permutes elements; local shape unchanged. Preserve global sharding metadata.
             processed_state_dict[key] = replace(value, data=new_data, local_shape=new_data.shape)
@@ -1856,7 +1802,7 @@ def _process_state_dict_for_glu_interleaving(
                 processed_state_dict[key] = value
                 continue
             new_data = _apply_glu_interleave_to_tensor_data(
-                key, value.data, interleave_size, interleave
+                value.data, interleave_size, interleave
             )
             processed_state_dict[key] = replace(value, data=new_data)
             num_keys_processed += 1
@@ -1864,7 +1810,7 @@ def _process_state_dict_for_glu_interleaving(
 
         if isinstance(value, torch.Tensor):
             processed_state_dict[key] = _apply_glu_interleave_to_tensor_data(
-                key, value, interleave_size, interleave
+                value, interleave_size, interleave
             )
             num_keys_processed += 1
             continue
