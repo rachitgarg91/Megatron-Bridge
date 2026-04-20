@@ -30,6 +30,7 @@ from typing import Any, Callable, Literal, Optional, Protocol, Union, runtime_ch
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 from megatron.core import dist_checkpointing, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, ShardedTensor
 from megatron.core.dist_checkpointing.serialization import (
@@ -91,8 +92,10 @@ from megatron.bridge.utils.import_utils import safe_import
 _, HAVE_RESIL = safe_import("nvidia_resiliency_ext.checkpointing")
 
 try:
+    from megatron.core.distributed.fsdp.src.megatron_fsdp import MegatronFSDP
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         preprocess_state_dict_for_uneven_dtensor,
+        gather_uneven_dtensor_to_full_tensor,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
@@ -897,14 +900,20 @@ def save_checkpoint(
         print_rank_0(f'[GLU Interleaving] De-interleaving GLU weights on save: model has interleaved weights (size={model_interleave_size}), converting to contiguous format for checkpoint')
         if len(model) == 1:
             state_dict["model"] = _process_state_dict_for_glu_interleaving(
-                state_dict["model"], model_interleave_size, interleave=False
+                state_dict["model"],
+                model_interleave_size,
+                interleave=False,
+                use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
             )
         else:
             for i in range(len(model)):
                 model_key = "model%d" % i
                 if model_key in state_dict:
                     state_dict[model_key] = _process_state_dict_for_glu_interleaving(
-                        state_dict[model_key], model_interleave_size, interleave=False
+                        state_dict[model_key],
+                        model_interleave_size,
+                        interleave=False,
+                        use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
                     )
 
     # Apply PEFT filtering to save adapter-only checkpoints
@@ -1768,6 +1777,7 @@ def _process_state_dict_for_glu_interleaving(
     model_state_dict: dict[str, Any],
     interleave_size: int,
     interleave: bool = True,
+    use_megatron_fsdp: bool = False,
 ) -> dict[str, Any]:
     """Process GLU weights and biases in state dict for interleaving or de-interleaving.
     
@@ -1779,14 +1789,50 @@ def _process_state_dict_for_glu_interleaving(
     """
     if not isinstance(model_state_dict, dict):
         return model_state_dict
+    
+    if use_megatron_fsdp:
+        # Get global offset information for un-even re-sharding with Megatron-FSDP.
+        model_state_dict = preprocess_state_dict_for_uneven_dtensor(model_state_dict)
 
     processed_state_dict: dict[str, Any] = {}
     num_keys_processed = 0
     operation = "interleaved" if interleave else "de-interleaved"
 
-    for key, value in model_state_dict.items():
+    # Interleave relevant states. Sort keys for Megatron-FSDP collectives.
+    sorted_keys = sorted(model_state_dict.keys())
+    for key in sorted_keys:
+        # Get model state.
+        value = model_state_dict[key]
         if not _is_swiglu_fc1_checkpoint_key(key):
             processed_state_dict[key] = value
+            continue
+        
+        if use_megatron_fsdp:
+            # Un-shard [W,V] and interleave on dim=0.
+            unsharded_value = gather_uneven_dtensor_to_full_tensor(value)._local_tensor
+            interleaved_value = _apply_glu_interleave_to_tensor_data(
+                unsharded_value,
+                interleave_size,
+                interleave,
+            )
+
+            # Re-shard the Megatron-FSDP DTensor.
+            value_metadata = value._local_tensor.__create_chunk_list__()[0]
+            slices = tuple(
+                slice(o, o + s)
+                for o, s in zip(value_metadata.offsets, value_metadata.sizes)
+            )
+            resharded_value = DTensor.from_local(
+                interleaved_value[slices],
+                device_mesh=value.device_mesh,
+                placements=value.placements,
+                shape=value.shape,
+                stride=value.stride(),
+            )
+
+            # Install interleaved + resharded weight into the state dictionary.
+            processed_state_dict[key] = resharded_value
+            num_keys_processed += 1
             continue
 
         if isinstance(value, ShardedTensor):
@@ -1832,6 +1878,12 @@ def _process_state_dict_for_glu_interleaving(
 
 def _load_model_state_dict(module: torch.nn.Module, state_dict: dict[str, Any], strict: bool):
     """Helper function to load state dict with fallback for missing extra states."""
+    if HAVE_MEGATRON_FSDP and isinstance(module, MegatronFSDP):
+        # Because the state dictionary was generated from the nested module of Megatron-FSDP,
+        # but MegatronFSDP.load_state_dict() is called at MegatronFSDP(torch.nn.Module).
+        # In Megatron-LM, handled via adapter: FullyShardedDataParallel.load_state_dict().
+        for key in list(state_dict.keys()):
+            state_dict[f"module.{key}"] = state_dict.pop(key)
     try:
         module.load_state_dict(state_dict, strict=strict)
     except Exception as e:
@@ -2177,7 +2229,7 @@ def _load_checkpoint_from_path(
         update_num_microbatches(consumed_samples=state.train_state.consumed_train_samples, verbose=True)
 
     # Load model weights
-    if not skip_load_to_model_and_opt and ckpt_type != CheckpointType.FSDP_DTENSOR:
+    if not skip_load_to_model_and_opt:
         # Process state dict for GLU interleaving if needed
         # Assumption: checkpoints are always in contiguous (non-interleaved) format
         from megatron.core.utils import get_model_config
@@ -2200,14 +2252,18 @@ def _load_checkpoint_from_path(
             )
             if len(model) == 1:
                 state_dict["model"] = _process_state_dict_for_glu_interleaving(
-                    state_dict["model"], model_interleave_size
+                    state_dict["model"],
+                    model_interleave_size,
+                    use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
                 )
             else:
                 for i in range(len(model)):
                     model_key = "model%d" % i
                     if model_key in state_dict:
                         state_dict[model_key] = _process_state_dict_for_glu_interleaving(
-                            state_dict[model_key], model_interleave_size
+                            state_dict[model_key],
+                            model_interleave_size,
+                            use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
                         )
 
         # Handle PEFT resume for strict loading
