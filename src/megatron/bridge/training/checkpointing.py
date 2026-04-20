@@ -1734,10 +1734,14 @@ def _interleave_glu_tensor(tensor: torch.Tensor, interleave_size: int) -> torch.
 
 
 def _is_swiglu_fc1_checkpoint_key(key: str) -> bool:
-    """True for MoE local-expert SwiGLU linear_fc1 weights/biases (not shared_experts)
-    and dense SwiGLU linear_fc1 weights/biases."""
+    """True for MoE local-expert SwiGLU linear_fc1 weights/biases (not shared_experts).
+
+    Dense ``mlp.linear_fc1`` is included only when ``USE_ACT_FUSION_FOR_DENSE=1`` (same block layout
+    as fused experts); otherwise dense weights stay contiguous and must not be permuted.
+    """
     is_swiglu_fc1_dense = (
-        "experts" not in key
+        os.environ.get("USE_ACT_FUSION_FOR_DENSE", "0") == "1"
+        and "experts" not in key
         and "mlp" in key
         and ("linear_fc1.weight" in key or "linear_fc1.bias" in key)
     )
